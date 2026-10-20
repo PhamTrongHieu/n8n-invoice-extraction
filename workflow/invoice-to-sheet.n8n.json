@@ -1,0 +1,394 @@
+{
+  "name": "Invoice to Google Sheet with totals check (vision LLM)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "invoice-extract",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "id": "b2c1d3e4-0001-4a1e-9b11-000000000001",
+      "name": "Receive invoice",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "b2c1d3e4-0001-4a1e-9b11-000000000001"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Entry gate: checks the shared secret, the file and the daily cap, then builds the Gemini request.\n// Never throws: every branch returns a clean JSON answer instead of failing halfway.\nconst MODEL = 'gemini-3.1-flash-lite';            // change the model in this one place\nconst SHARED_SECRET = 'REPLACE_WITH_SHARED_SECRET';\nconst MAX_BYTES = 10 * 1024 * 1024;               // keep in sync with the upload app's max file size\nconst DAILY_LIMIT = 60;                           // max extractions per day (cost guard)\nconst ALLOWED = { 'application/pdf': 'document', 'image/png': 'image', 'image/jpeg': 'image' };\n\nconst item = $input.first();\nconst headers = item.json.headers || {};\nconst reject = (status, error) => [{ json: { ok: false, status, error } }];\n\nif (String(headers['x-demo-secret'] || '') !== SHARED_SECRET) return reject(401, 'Unauthorized.');\n\nconst binaries = item.binary || {};\nconst key = binaries.invoice ? 'invoice' : Object.keys(binaries)[0];\nif (!key) return reject(400, 'No file received.');\n\nconst meta = binaries[key] || {};\nconst mime = String(meta.mimeType || '').toLowerCase();\nconst kind = ALLOWED[mime];\nif (!kind) return reject(415, 'Only PDF, JPG or PNG files are accepted.');\n\nlet buf = null;\nif (meta.data && !meta.id) { try { buf = Buffer.from(meta.data, 'base64'); } catch (e) { buf = null; } }\nif (!buf || !buf.length) {\n  try { buf = await this.helpers.getBinaryDataBuffer(0, key); }\n  catch (e) { return reject(500, 'Could not read the uploaded file.'); }\n}\nif (!buf || !buf.length) return reject(400, 'The file is empty.');\nif (buf.length > MAX_BYTES) return reject(413, 'That file is larger than 10 MB.');\n\n// Do not trust the browser's Content-Type: check magic bytes\nconst head = buf.subarray(0, 8);\nconst isPdf = head.subarray(0, 4).toString('latin1') === '%PDF';\nconst isPng = head.length >= 8 && head.equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));\nconst isJpg = head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff;\nif (!((mime === 'application/pdf' && isPdf) || (mime === 'image/png' && isPng) || (mime === 'image/jpeg' && isJpg))) {\n  return reject(415, 'That file does not look like a PDF, JPG or PNG.');\n}\n\n// Daily cap stored in workflow static data (no database needed)\nconst store = $getWorkflowStaticData('global');\nconst today = new Date().toISOString().slice(0, 10);\nif (store.day !== today) { store.day = today; store.count = 0; }\nstore.count = (store.count || 0) + 1;\nif (store.count > DAILY_LIMIT) {\n  return reject(429, 'The demo has reached its daily limit. Please try again tomorrow, or contact the site owner.');\n}\n\nconst schema = {\n  type: 'object',\n  properties: {\n    not_an_invoice: { type: 'boolean', description: 'true if the document is not an invoice, bill or receipt' },\n    vendor: { type: 'string', description: 'Name of the company issuing the invoice' },\n    vendor_address: { type: 'string' },\n    invoice_number: { type: 'string' },\n    invoice_date: { type: 'string', description: 'ISO date YYYY-MM-DD' },\n    due_date: { type: 'string', description: 'ISO date YYYY-MM-DD, empty if absent' },\n    currency: { type: 'string', description: 'ISO 4217 code such as USD, AUD, EUR' },\n    subtotal: { type: 'number' },\n    tax: { type: 'number' },\n    total: { type: 'number' },\n    line_items: {\n      type: 'array',\n      items: {\n        type: 'object',\n        properties: {\n          description: { type: 'string' },\n          qty: { type: 'number' },\n          unit_price: { type: 'number' },\n          amount: { type: 'number' },\n        },\n        required: ['description', 'amount'],\n      },\n    },\n    notes: { type: 'string', description: 'Anything unusual: handwriting, stamps, unreadable areas' },\n  },\n  required: ['not_an_invoice', 'vendor', 'invoice_number', 'invoice_date', 'currency', 'total', 'line_items'],\n};\n\nconst prompt = [\n  'Extract the fields of this supplier invoice.',\n  'Rules:',\n  '- Use only what is printed in the document. Never invent a value.',\n  '- Numbers must be plain numbers: no currency symbol, no thousands separator, dot as decimal mark.',\n  '- Dates in ISO format YYYY-MM-DD. If a date is written day/month/year, convert it.',\n  '- If a field is not present, use an empty string for text and 0 for numbers you cannot read.',\n  '- line_items: one entry per billed line; ignore subtotal, tax and total rows.',\n  '- If the document is not an invoice, bill or receipt, set not_an_invoice to true and leave the other fields empty.',\n  '- If part of the document is unreadable, say so in notes instead of guessing.',\n].join('\\n');\n\nreturn [{\n  json: {\n    ok: true,\n    request_id: 'inv-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7),\n    received_at: new Date().toISOString(),\n    source: String((item.json.body && item.json.body.source) || 'unknown').slice(0, 60),\n    file_name: String(meta.fileName || 'upload').slice(0, 120),\n    file_type: mime,\n    file_size: buf.length,\n    model: MODEL,\n    geminiBody: {\n      model: MODEL,\n      system_instruction: 'You are an accounts-payable data extraction service. You return only the structured fields requested, taken verbatim from the document.',\n      input: [\n        { type: 'text', text: prompt },\n        { type: kind, data: buf.toString('base64'), mime_type: mime },\n      ],\n      response_format: { type: 'text', mime_type: 'application/json', schema },\n      generation_config: { temperature: 0, max_output_tokens: 2000 },\n    },\n  },\n}];"
+      },
+      "id": "b2c1d3e4-0002-4a1e-9b11-000000000002",
+      "name": "Check request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-ok",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b2c1d3e4-0003-4a1e-9b11-000000000003",
+      "name": "Accepted?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/interactions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.geminiBody) }}",
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "b2c1d3e4-0004-4a1e-9b11-000000000004",
+      "name": "Gemini extract",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        -140
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_AFTER_IMPORT",
+          "name": "Gemini - AI Studio (x-goog-api-key)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Read the Gemini answer, coerce numbers, reconcile totals, sanitise strings before writing to the sheet.\n// Every error branch returns valid JSON to the caller; nothing throws.\nconst gate = $('Check request').first().json;\nconst raw = $json || {};\nconst started = Date.parse(gate.received_at || '') || Date.now();\n\nconst clean = (v, max = 200) => String(v == null ? '' : v).split('').filter((ch) => ch.charCodeAt(0) > 31 && ch.charCodeAt(0) !== 127).join('').trim().slice(0, max);\nconst sheetSafe = (v) => (/^[=+\\-@\\t\\r]/.test(v) ? \"'\" + v : v);          // block formula injection in Google Sheets\nconst round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;\nconst num = (v) => {\n  if (typeof v === 'number' && Number.isFinite(v)) return round2(v);\n  if (typeof v !== 'string') return null;\n  const s = v.replace(/[^0-9.,\\-]/g, '').replace(/,(?=\\d{3}\\b)/g, '').replace(',', '.');\n  const n = Number.parseFloat(s);\n  return Number.isFinite(n) ? round2(n) : null;\n};\n\nfunction geminiText(r) {\n  const out = [];\n  const walk = (steps) => {\n    for (const s of steps || []) for (const c of s.content || []) if (typeof c.text === 'string') out.push(c.text);\n  };\n  if (Array.isArray(r.steps)) walk(r.steps);\n  if (!out.length && Array.isArray(r.output)) walk(r.output);\n  if (!out.length && Array.isArray(r.candidates)) {\n    for (const c of r.candidates) for (const p of (c.content && c.content.parts) || []) if (p.text) out.push(p.text);\n  }\n  return out.join('').trim();\n}\n\nconst base = {\n  request_id: gate.request_id,\n  file: { name: gate.file_name, type: gate.file_type, size_kb: Math.round((gate.file_size || 0) / 1024) },\n  model: gate.model,\n};\n\nconst fail = (message) => {\n  const response = Object.assign({}, base, { ok: false, error: message, validation: { ok: false, issues: [message] } });\n  return [{ json: { response, row: null, failed: true } }];\n};\n\nif (raw.error || raw.status === 'failed') {\n  return fail('The extraction service did not answer. Please try again in a minute.');\n}\n\nlet text = geminiText(raw);\nif (!text) return fail('The model returned an empty answer. Please try another file.');\ntext = text.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();\n\nconst unreadable = 'The model did not return readable data. Please try another file.';\nlet ex = null;\ntry { ex = JSON.parse(text); } catch (e) {\n  const m = text.match(/\\{[\\s\\S]*\\}/);\n  if (!m) return fail(unreadable);\n  try { ex = JSON.parse(m[0]); } catch (e2) { return fail(unreadable); }\n}\nif (!ex || typeof ex !== 'object' || Array.isArray(ex)) return fail(unreadable);\n// No core field at all => treat the model output as garbage; never write an empty row\nif (ex.not_an_invoice !== true && !ex.vendor && !ex.total && !ex.invoice_number && !Array.isArray(ex.line_items)) {\n  return fail(unreadable);\n}\n\nif (ex.not_an_invoice === true) {\n  const response = Object.assign({}, base, {\n    ok: false,\n    error: 'That file does not look like an invoice. Try one of the sample invoices.',\n    validation: { ok: false, issues: ['not an invoice'] },\n  });\n  return [{ json: { response, row: null, failed: true } }];\n}\n\nconst items = Array.isArray(ex.line_items) ? ex.line_items.slice(0, 40) : [];\nconst line_items = items.map((i) => ({\n  description: clean(i && i.description, 120),\n  qty: num(i && i.qty),\n  unit_price: num(i && i.unit_price),\n  amount: num(i && i.amount),\n}));\n\nconst fields = {\n  vendor: clean(ex.vendor, 120),\n  vendor_address: clean(ex.vendor_address, 200),\n  invoice_number: clean(ex.invoice_number, 60),\n  invoice_date: clean(ex.invoice_date, 20),\n  due_date: clean(ex.due_date, 20),\n  currency: clean(ex.currency, 8).toUpperCase(),\n  subtotal: num(ex.subtotal),\n  tax: num(ex.tax),\n  total: num(ex.total),\n  notes: clean(ex.notes, 300),\n};\n\n// Reconciliation: the LLM reads, code checks the maths.\nconst issues = [];\nconst TOL = 0.02;\nconst lineSum = line_items.length ? round2(line_items.reduce((a, i) => a + (i.amount || 0), 0)) : null;\nif (!fields.total) issues.push('no total found');\nif (!fields.vendor) issues.push('no vendor name found');\nif (!fields.invoice_date) issues.push('no invoice date found');\nif (lineSum != null && fields.subtotal != null && Math.abs(lineSum - fields.subtotal) > TOL) {\n  issues.push('line items add up to ' + lineSum.toFixed(2) + ' but subtotal says ' + fields.subtotal.toFixed(2));\n}\nif (fields.subtotal != null && fields.tax != null && fields.total != null &&\n    Math.abs(round2(fields.subtotal + fields.tax) - fields.total) > TOL) {\n  issues.push('subtotal + tax = ' + round2(fields.subtotal + fields.tax).toFixed(2) + ' but total says ' + fields.total.toFixed(2));\n}\nif (lineSum != null && fields.subtotal == null && fields.tax == null && fields.total != null &&\n    Math.abs(lineSum - fields.total) > TOL) {\n  issues.push('line items add up to ' + lineSum.toFixed(2) + ' but total says ' + fields.total.toFixed(2));\n}\n\nconst usage = raw.usage || {};\nconst response = Object.assign({}, base, fields, {\n  ok: true,\n  line_items,\n  line_item_sum: lineSum,\n  validation: { ok: issues.length === 0, issues },\n  latency_ms: Date.now() - started,\n  tokens: { in: usage.total_input_tokens != null ? usage.total_input_tokens : null, out: usage.total_output_tokens != null ? usage.total_output_tokens : null },\n});\n\nconst row = {\n  request_id: gate.request_id,\n  received_at: gate.received_at,\n  source: sheetSafe(clean(gate.source, 60)),\n  file_name: sheetSafe(clean(gate.file_name, 120)),\n  file_type: gate.file_type,\n  vendor: sheetSafe(fields.vendor),\n  invoice_number: sheetSafe(fields.invoice_number),\n  invoice_date: sheetSafe(fields.invoice_date),\n  currency: sheetSafe(fields.currency),\n  subtotal: fields.subtotal != null ? fields.subtotal : '',\n  tax: fields.tax != null ? fields.tax : '',\n  total: fields.total != null ? fields.total : '',\n  line_item_count: line_items.length,\n  reconciled: issues.length === 0 ? 'yes' : 'no',\n  issues: sheetSafe(clean(issues.join(' | '), 400)),\n  model: gate.model,\n  latency_ms: response.latency_ms,\n  tokens_in: response.tokens.in != null ? response.tokens.in : '',\n  tokens_out: response.tokens.out != null ? response.tokens.out : '',\n};\n\nreturn [{ json: { response, row, failed: false } }];"
+      },
+      "id": "b2c1d3e4-0005-4a1e-9b11-000000000005",
+      "name": "Parse and reconcile",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        -140
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c-not-failed",
+              "leftValue": "={{ $json.failed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b2c1d3e4-0006-4a1e-9b11-000000000006",
+      "name": "Extraction worked?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1200,
+        -140
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "REPLACE_WITH_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Invoices"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "id": "b2c1d3e4-0007-4a1e-9b11-000000000007",
+      "name": "Log to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1600,
+        -240
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_AFTER_IMPORT",
+          "name": "Google Sheets account"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify(Object.assign({}, $('Parse and reconcile').item.json.response, { sheet_written: $json.request_id != null && !$json.error })) }}",
+        "options": {
+          "responseCode": 200,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "cache-control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      },
+      "id": "b2c1d3e4-0008-4a1e-9b11-000000000008",
+      "name": "Respond with result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1820,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": 422,
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "cache-control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      },
+      "id": "b2c1d3e4-0009-4a1e-9b11-000000000009",
+      "name": "Respond with extraction error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1440,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, error: $json.error }) }}",
+        "options": {
+          "responseCode": "={{ $json.status || 400 }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "cache-control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      },
+      "id": "b2c1d3e4-0010-4a1e-9b11-000000000010",
+      "name": "Respond with rejection",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Google Sheets (Map Automatically) only sees top-level fields,\n// so flatten the row into one item whose keys match the 19 sheet columns.\nconst row = $input.first().json.row || {};\nreturn [{ json: row }];"
+      },
+      "id": "b2c1d3e4-0011-4a1e-9b11-000000000011",
+      "name": "Row for Sheets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        -240
+      ]
+    }
+  ],
+  "connections": {
+    "Receive invoice": {
+      "main": [
+        [
+          {
+            "node": "Check request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check request": {
+      "main": [
+        [
+          {
+            "node": "Accepted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Accepted?": {
+      "main": [
+        [
+          {
+            "node": "Gemini extract",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond with rejection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini extract": {
+      "main": [
+        [
+          {
+            "node": "Parse and reconcile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse and reconcile": {
+      "main": [
+        [
+          {
+            "node": "Extraction worked?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extraction worked?": {
+      "main": [
+        [
+          {
+            "node": "Row for Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond with extraction error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log to Google Sheets": {
+      "main": [
+        [
+          {
+            "node": "Respond with result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Row for Sheets": {
+      "main": [
+        [
+          {
+            "node": "Log to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "timezone": "UTC"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
